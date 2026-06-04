@@ -1,162 +1,65 @@
-import { useState, useRef } from "react";
-import * as XLSX from "xlsx";
+import { useEffect, useRef, useState } from "react";
+import {
+  readWorkbook,
+  cleanWorkbook,
+  buildCleanedXlsx,
+  writeXlsx,
+} from "./lib/cleaner.js";
+import { scanForIRCCodes, loadIRCIndex } from "./lib/irc.js";
+import { toMarkdown, toJSON, downloadBlob } from "./lib/exporter.js";
+import "./App.css";
 
-const MAX_OUTPUT_CHARS = 120000;
-const MAX_ROWS_PER_SHEET = 600;
-const MAX_COLS = 60;
-const MIN_DATA_ROWS = 2;
-
-function readExcelForCleaning(file) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = (e) => {
-      try {
-        const data = new Uint8Array(e.target.result);
-        const wb = XLSX.read(data, { type: "array" });
-        resolve(wb);
-      } catch (err) {
-        reject(err);
-      }
-    };
-    r.onerror = () => reject(new Error("File read failed"));
-    r.readAsArrayBuffer(file);
-  });
-}
-
-function findLastMeaningfulCol(rows, maxCols) {
-  let last = 0;
-  for (const row of rows) {
-    for (let c = Math.min(row.length, maxCols) - 1; c >= last; c--) {
-      const v = row[c];
-      if (v !== null && v !== undefined && String(v).trim() !== "") {
-        last = Math.max(last, c + 1);
-        break;
-      }
-    }
-  }
-  return Math.min(last, maxCols);
-}
-
-function sheetStats(ws) {
-  const json = window.XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
-  const dataRows = json.filter(row => row.some(c => c !== null && c !== undefined && String(c).trim() !== ""));
-  return { totalRows: json.length, dataRows };
-}
-
-function cleanSheet(ws, sheetName) {
-  const json = window.XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
-  const dataRows = json.filter(row => row.some(c => c !== null && c !== undefined && String(c).trim() !== ""));
-
-  if (dataRows.length < MIN_DATA_ROWS) {
-    return { skipped: true, reason: "too few data rows (" + dataRows.length + ")" };
-  }
-
-  const lastCol = findLastMeaningfulCol(dataRows, MAX_COLS);
-
-  const trimmed = dataRows.slice(0, MAX_ROWS_PER_SHEET).map((row, rowIdx) => {
-    const out = [];
-    for (let c = 0; c < lastCol; c++) {
-      const v = row[c];
-      out.push(v !== null && v !== undefined ? String(v).trim() : "");
-    }
-    return out;
-  });
-
-  const truncated = dataRows.length > MAX_ROWS_PER_SHEET;
-  const colsTruncated = findLastMeaningfulCol(dataRows, Infinity) > MAX_COLS;
-
-  return {
-    skipped: false,
-    rows: trimmed,
-    originalRows: dataRows.length,
-    originalCols: findLastMeaningfulCol(dataRows, Infinity),
-    keptRows: trimmed.length,
-    keptCols: lastCol,
-    truncated,
-    colsTruncated,
-  };
-}
-
-function buildCleanWorkbook(results) {
-  const wb = XLSX.utils.book_new();
-  for (const r of results) {
-    if (r.skipped) continue;
-    const ws = window.XLSX.utils.aoa_to_sheet(r.rows);
-    window.XLSX.utils.book_append_sheet(wb, ws, r.sheetName.slice(0, 31));
-  }
-  return wb;
-}
-
-function buildTextPreview(results) {
-  let txt = "";
-  let chars = 0;
-  for (const r of results) {
-    if (r.skipped) continue;
-    const header = `\n=== Sheet: ${r.sheetName} (${r.keptRows} rows × ${r.keptCols} cols)${r.truncated ? " [ROWS TRUNCATED]" : ""}${r.colsTruncated ? " [COLS TRUNCATED]" : ""} ===\n`;
-    txt += header;
-    chars += header.length;
-    for (const row of r.rows) {
-      const line = row.join(",") + "\n";
-      if (chars + line.length > MAX_OUTPUT_CHARS) {
-        txt += "[...remaining content truncated for size limit...]\n";
-        return txt;
-      }
-      txt += line;
-      chars += line.length;
-    }
-  }
-  return txt;
-}
+const DEFAULT_OPTIONS = {
+  collapseBlankRows: true,
+  dropEmptyMidColumns: true,
+  dropEmptyMidRows: false,
+};
 
 export default function App() {
-  const [stage, setStage] = useState("idle"); // idle | analyzing | done | error
+  const [stage, setStage] = useState("idle");
   const [file, setFile] = useState(null);
-  const [results, setResults] = useState([]);
-  const [summary, setSummary] = useState(null);
+  const [sheets, setSheets] = useState([]);
+  const [ircCodes, setIrcCodes] = useState(new Map());
+  const [ircLibrary, setIrcLibrary] = useState(null);
   const [error, setError] = useState("");
-  const [textPreview, setTextPreview] = useState("");
-  const [showPreview, setShowPreview] = useState(false);
+  const [options, setOptions] = useState(DEFAULT_OPTIONS);
+  const [activeSheet, setActiveSheet] = useState(0);
   const inputRef = useRef(null);
+
+  useEffect(() => {
+    loadIRCIndex().then(setIrcLibrary);
+  }, []);
 
   async function processFile(f) {
     setFile(f);
     setStage("analyzing");
     setError("");
-    setResults([]);
-    setSummary(null);
-    setTextPreview("");
-    setShowPreview(false);
-
+    setSheets([]);
+    setIrcCodes(new Map());
+    setActiveSheet(0);
     try {
-      const wb = await readExcelForCleaning(f);
-      const sheetResults = [];
+      const wb = await readWorkbook(f);
+      const cleaned = cleanWorkbook(wb, options);
+      const codes = scanForIRCCodes(cleaned);
+      setSheets(cleaned);
+      setIrcCodes(codes);
+      setStage("done");
+    } catch (err) {
+      setError(err.message || "Processing failed");
+      setStage("error");
+    }
+  }
 
-      for (const sn of wb.SheetNames) {
-        const ws = wb.Sheets[sn];
-        const res = cleanSheet(ws, sn);
-        sheetResults.push({ sheetName: sn, ...res });
-      }
-
-      const kept = sheetResults.filter(r => !r.skipped);
-      const skipped = sheetResults.filter(r => r.skipped);
-      const totalOrigCols = sheetResults.reduce((a, r) => a + (r.originalCols || 0), 0);
-      const totalKeptCols = kept.reduce((a, r) => a + (r.keptCols || 0), 0);
-      const totalOrigRows = sheetResults.reduce((a, r) => a + (r.originalRows || 0), 0);
-      const totalKeptRows = kept.reduce((a, r) => a + (r.keptRows || 0), 0);
-
-      setResults(sheetResults);
-      setSummary({
-        totalSheets: wb.SheetNames.length,
-        keptSheets: kept.length,
-        skippedSheets: skipped.length,
-        totalOrigRows,
-        totalKeptRows,
-        totalOrigCols,
-        totalKeptCols,
-      });
-
-      const preview = buildTextPreview(sheetResults);
-      setTextPreview(preview);
+  async function reprocess(nextOptions) {
+    if (!file) return;
+    setOptions(nextOptions);
+    setStage("analyzing");
+    try {
+      const wb = await readWorkbook(file);
+      const cleaned = cleanWorkbook(wb, nextOptions);
+      const codes = scanForIRCCodes(cleaned);
+      setSheets(cleaned);
+      setIrcCodes(codes);
       setStage("done");
     } catch (err) {
       setError(err.message || "Processing failed");
@@ -176,245 +79,312 @@ export default function App() {
     e.target.value = "";
   }
 
-  function downloadClean() {
-    const wb = buildCleanWorkbook(results);
-    const base = (file?.name || "cleaned").replace(/\.xlsx?$/i, "");
-    window.XLSX.writeFile(wb, base + "_cleaned.xlsx");
+  function baseName() {
+    return (file?.name || "dpr").replace(/\.(xlsx|xls|xlsm|csv)$/i, "");
   }
 
-  function downloadTextPreview() {
-    const blob = new Blob([textPreview], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = (file?.name || "dpr").replace(/\.xlsx?$/i, "") + "_text_preview.txt";
-    a.click();
-    URL.revokeObjectURL(url);
+  function downloadXlsx() {
+    const wb = buildCleanedXlsx(sheets);
+    writeXlsx(wb, `${baseName()}_cleaned.xlsx`);
+  }
+
+  function downloadMarkdown() {
+    const md = toMarkdown(sheets, {
+      fileName: file?.name,
+      generatedAt: new Date().toISOString(),
+      ircCodes,
+    });
+    downloadBlob(md, `${baseName()}_cleaned.md`, "text/markdown;charset=utf-8");
+  }
+
+  function downloadJSON() {
+    const j = toJSON(sheets, {
+      fileName: file?.name,
+      generatedAt: new Date().toISOString(),
+      ircCodes,
+    });
+    downloadBlob(j, `${baseName()}_cleaned.json`, "application/json;charset=utf-8");
   }
 
   function reset() {
     setStage("idle");
     setFile(null);
-    setResults([]);
-    setSummary(null);
+    setSheets([]);
+    setIrcCodes(new Map());
     setError("");
-    setTextPreview("");
-    setShowPreview(false);
+    setOptions(DEFAULT_OPTIONS);
+    setActiveSheet(0);
   }
 
-  const kept = results.filter(r => !r.skipped);
-  const skipped = results.filter(r => r.skipped);
+  const kept = sheets.filter((s) => !s.empty);
+  const skipped = sheets.filter((s) => s.empty);
+  const totalOrigRows = sheets.reduce((a, s) => a + (s.originalRowCount || 0), 0);
+  const totalKeptRows = kept.reduce((a, s) => a + (s.cleanedRowCount || 0), 0);
+  const totalRemovedCols = sheets.reduce((a, s) => a + (s.removedColumnIndexes?.length || 0), 0);
+  const totalCollapsed = sheets.reduce((a, s) => a + (s.collapsedBlankRowRuns || 0), 0);
 
   return (
-    <>
-      <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css" />
-      <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" />
-
-      <h2 className="sr-only">DPR Excel Cleaner — pre-process large Excel DPRs before uploading to Ver63</h2>
-
-      <div style={{ padding: "1.5rem 0 2rem" }}>
-
-        {/* Header */}
-        <div style={{ marginBottom: "1.5rem" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "6px" }}>
-            <div style={{
-              width: 36, height: 36, borderRadius: "var(--border-radius-md)",
-              background: "var(--color-background-info)", display: "flex",
-              alignItems: "center", justifyContent: "center"
-            }}>
-              <i className="ti ti-table-import" style={{ fontSize: 18, color: "var(--color-text-info)" }} aria-hidden="true" />
-            </div>
-            <div>
-              <p style={{ margin: 0, fontWeight: 500, fontSize: 17 }}>DPR Excel Cleaner</p>
-              <p style={{ margin: 0, fontSize: 13, color: "var(--color-text-secondary)" }}>Pre-processor for Ver63 — strips phantom columns, trims oversized sheets</p>
-            </div>
-          </div>
+    <div className="app">
+      <header className="app-header">
+        <div className="app-logo">DPR</div>
+        <div>
+          <h1>DPR Excel Cleaner</h1>
+          <p className="muted">
+            Strip phantom cells, trailing empties and whitespace junk from DPR workbooks —
+            without losing any actual data. Outputs a cleaned <code>.xlsx</code>, a Claude-ready
+            Markdown report, and a structured JSON payload.
+          </p>
         </div>
+      </header>
 
-        {/* Upload zone */}
-        {stage === "idle" && (
-          <div
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={handleDrop}
-            onClick={() => inputRef.current?.click()}
-            style={{
-              border: "0.5px dashed var(--color-border-primary)",
-              borderRadius: "var(--border-radius-lg)",
-              padding: "2.5rem 1.5rem",
-              textAlign: "center",
-              cursor: "pointer",
-              background: "var(--color-background-secondary)",
-            }}
-          >
-            <input ref={inputRef} type="file" accept=".xlsx,.xls" onChange={handleSelect} style={{ display: "none" }} />
-            <i className="ti ti-file-spreadsheet" style={{ fontSize: 40, color: "var(--color-text-secondary)", display: "block", marginBottom: 12 }} aria-hidden="true" />
-            <p style={{ margin: "0 0 6px", fontWeight: 500 }}>Drop your DPR Excel here</p>
-            <p style={{ margin: 0, fontSize: 13, color: "var(--color-text-secondary)" }}>or click to browse — .xlsx / .xls only</p>
+      {stage === "idle" && (
+        <section
+          className="drop"
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={handleDrop}
+          onClick={() => inputRef.current?.click()}
+        >
+          <input
+            ref={inputRef}
+            type="file"
+            accept=".xlsx,.xls,.xlsm"
+            onChange={handleSelect}
+            hidden
+          />
+          <div className="drop-icon">+</div>
+          <p className="drop-title">Drop your DPR workbook here</p>
+          <p className="drop-sub">
+            or click to browse — <code>.xlsx</code> / <code>.xls</code> / <code>.xlsm</code> · processed
+            entirely in your browser, nothing uploaded.
+          </p>
+        </section>
+      )}
+
+      {stage === "analyzing" && (
+        <section className="status">
+          <div className="spinner" aria-hidden="true" />
+          <p className="status-title">Scanning sheets…</p>
+          <p className="muted">{file?.name}</p>
+        </section>
+      )}
+
+      {stage === "error" && (
+        <section className="error">
+          <p className="error-title">Processing failed</p>
+          <p>{error}</p>
+          <button onClick={reset} className="btn">Try another file</button>
+        </section>
+      )}
+
+      {stage === "done" && (
+        <section className="results">
+          <div className="stats">
+            <Stat label="Sheets" value={sheets.length} />
+            <Stat label="With data" value={kept.length} accent="ok" />
+            <Stat label="Empty" value={skipped.length} accent={skipped.length ? "warn" : ""} />
+            <Stat label="Rows kept" value={totalKeptRows.toLocaleString()} />
+            <Stat label="Original rows" value={totalOrigRows.toLocaleString()} accent="muted" />
+            <Stat label="Empty cols removed" value={totalRemovedCols} />
+            <Stat label="Blank-row runs collapsed" value={totalCollapsed} />
+            <Stat label="IRC codes found" value={ircCodes.size} accent={ircCodes.size ? "ok" : ""} />
           </div>
-        )}
 
-        {/* Analyzing */}
-        {stage === "analyzing" && (
-          <div style={{ textAlign: "center", padding: "3rem 1rem" }}>
-            <i className="ti ti-loader-2" style={{ fontSize: 36, color: "var(--color-text-secondary)", display: "block", marginBottom: 12, animation: "spin 1s linear infinite" }} aria-hidden="true" />
-            <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
-            <p style={{ margin: 0, fontWeight: 500 }}>Scanning sheets...</p>
-            <p style={{ margin: "4px 0 0", fontSize: 13, color: "var(--color-text-secondary)" }}>{file?.name}</p>
+          <div className="actions">
+            <button className="btn primary" onClick={downloadXlsx}>Download cleaned .xlsx</button>
+            <button className="btn" onClick={downloadMarkdown}>Download Markdown (Claude-ready)</button>
+            <button className="btn" onClick={downloadJSON}>Download JSON</button>
+            <button className="btn ghost" onClick={reset}>New file</button>
           </div>
-        )}
 
-        {/* Error */}
-        {stage === "error" && (
-          <div style={{
-            background: "var(--color-background-danger)",
-            border: "0.5px solid var(--color-border-danger)",
-            borderRadius: "var(--border-radius-md)", padding: "1rem 1.25rem", marginBottom: 16
-          }}>
-            <p style={{ margin: "0 0 4px", fontWeight: 500, color: "var(--color-text-danger)" }}>Processing failed</p>
-            <p style={{ margin: 0, fontSize: 13, color: "var(--color-text-danger)" }}>{error}</p>
-            <button onClick={reset} style={{ marginTop: 10 }}>Try another file</button>
-          </div>
-        )}
+          <CleaningOptions
+            options={options}
+            onChange={reprocess}
+          />
 
-        {/* Results */}
-        {stage === "done" && summary && (
-          <div>
-            {/* Stats row */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 10, marginBottom: "1.5rem" }}>
-              {[
-                { label: "Total sheets", val: summary.totalSheets },
-                { label: "Sheets kept", val: summary.keptSheets, ok: true },
-                { label: "Sheets skipped", val: summary.skippedSheets, warn: summary.skippedSheets > 0 },
-                { label: "Rows kept", val: summary.totalKeptRows.toLocaleString() },
-                { label: "Max cols/sheet", val: MAX_COLS },
-              ].map(s => (
-                <div key={s.label} style={{
-                  background: "var(--color-background-secondary)",
-                  borderRadius: "var(--border-radius-md)", padding: "0.75rem 1rem"
-                }}>
-                  <p style={{ margin: "0 0 2px", fontSize: 12, color: "var(--color-text-secondary)" }}>{s.label}</p>
-                  <p style={{
-                    margin: 0, fontWeight: 500, fontSize: 20,
-                    color: s.ok ? "var(--color-text-success)" : s.warn ? "var(--color-text-warning)" : "var(--color-text-primary)"
-                  }}>{s.val}</p>
-                </div>
-              ))}
-            </div>
-
-            {/* Actions */}
-            <div style={{ display: "flex", gap: 10, marginBottom: "1.5rem", flexWrap: "wrap" }}>
-              <button onClick={downloadClean} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <i className="ti ti-download" aria-hidden="true" />
-                Download cleaned .xlsx
-              </button>
-              <button onClick={downloadTextPreview} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <i className="ti ti-file-text" aria-hidden="true" />
-                Download text preview
-              </button>
-              <button onClick={() => setShowPreview(!showPreview)} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <i className={`ti ti-eye${showPreview ? "-off" : ""}`} aria-hidden="true" />
-                {showPreview ? "Hide" : "Show"} preview
-              </button>
-              <button onClick={reset} style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
-                <i className="ti ti-refresh" aria-hidden="true" />
-                New file
-              </button>
-            </div>
-
-            {/* Kept sheets */}
-            {kept.length > 0 && (
-              <div style={{ marginBottom: "1.5rem" }}>
-                <p style={{ margin: "0 0 8px", fontWeight: 500, fontSize: 14 }}>
-                  <i className="ti ti-check" style={{ color: "var(--color-text-success)", marginRight: 6 }} aria-hidden="true" />
-                  Kept sheets ({kept.length})
-                </p>
-                <div style={{
-                  border: "0.5px solid var(--color-border-tertiary)",
-                  borderRadius: "var(--border-radius-md)", overflow: "hidden"
-                }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                    <thead>
-                      <tr style={{ background: "var(--color-background-secondary)" }}>
-                        {["Sheet name", "Orig rows", "Kept rows", "Orig cols", "Kept cols", "Notes"].map(h => (
-                          <th key={h} style={{ padding: "7px 10px", textAlign: "left", fontWeight: 500, borderBottom: "0.5px solid var(--color-border-tertiary)", color: "var(--color-text-secondary)" }}>{h}</th>
-                        ))}
+          {ircCodes.size > 0 && (
+            <details className="panel" open>
+              <summary>IRC codes referenced in this DPR ({ircCodes.size})</summary>
+              <table className="tbl">
+                <thead>
+                  <tr><th>Code</th><th>Occurrences</th><th>First location</th><th>In library</th></tr>
+                </thead>
+                <tbody>
+                  {Array.from(ircCodes.entries()).map(([code, occs]) => {
+                    const inLib = ircLibrary?.files?.some((f) => f.code === code) || false;
+                    return (
+                      <tr key={code}>
+                        <td><code>{code}</code></td>
+                        <td>{occs.length}</td>
+                        <td className="muted">
+                          {occs[0].sheet} · r{occs[0].row + 1} c{occs[0].col + 1}
+                        </td>
+                        <td>{inLib ? <span className="pill ok">loaded</span> : <span className="pill muted">missing</span>}</td>
                       </tr>
-                    </thead>
-                    <tbody>
-                      {kept.map((r, i) => (
-                        <tr key={r.sheetName} style={{ background: i % 2 === 0 ? "transparent" : "var(--color-background-secondary)" }}>
-                          <td style={{ padding: "6px 10px", fontFamily: "monospace", fontSize: 12 }}>{r.sheetName}</td>
-                          <td style={{ padding: "6px 10px", color: "var(--color-text-secondary)" }}>{r.originalRows?.toLocaleString()}</td>
-                          <td style={{ padding: "6px 10px", color: r.truncated ? "var(--color-text-warning)" : "var(--color-text-primary)", fontWeight: r.truncated ? 500 : 400 }}>{r.keptRows}</td>
-                          <td style={{ padding: "6px 10px", color: "var(--color-text-secondary)" }}>{r.originalCols?.toLocaleString()}</td>
-                          <td style={{ padding: "6px 10px", color: r.colsTruncated ? "var(--color-text-warning)" : "var(--color-text-primary)", fontWeight: r.colsTruncated ? 500 : 400 }}>{r.keptCols}</td>
-                          <td style={{ padding: "6px 10px", fontSize: 11, color: "var(--color-text-secondary)" }}>
-                            {[r.truncated && "rows capped at " + MAX_ROWS_PER_SHEET, r.colsTruncated && "cols capped at " + MAX_COLS].filter(Boolean).join("; ") || "—"}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-
-            {/* Skipped sheets */}
-            {skipped.length > 0 && (
-              <div style={{ marginBottom: "1.5rem" }}>
-                <p style={{ margin: "0 0 8px", fontWeight: 500, fontSize: 14, color: "var(--color-text-secondary)" }}>
-                  <i className="ti ti-minus" style={{ marginRight: 6 }} aria-hidden="true" />
-                  Skipped sheets ({skipped.length}) — empty or near-empty
+                    );
+                  })}
+                </tbody>
+              </table>
+              {ircLibrary && (
+                <p className="muted small">
+                  IRC library: version {ircLibrary.version ?? "?"} · {ircLibrary.files?.length ?? 0} reference files loaded from <code>/irc-codes/</code>.
                 </p>
-                <div style={{
-                  display: "flex", flexWrap: "wrap", gap: 6
-                }}>
-                  {skipped.map(r => (
-                    <span key={r.sheetName} style={{
-                      padding: "3px 10px", borderRadius: "var(--border-radius-md)",
-                      background: "var(--color-background-secondary)",
-                      border: "0.5px solid var(--color-border-tertiary)",
-                      fontSize: 12, fontFamily: "monospace", color: "var(--color-text-tertiary)"
-                    }}>{r.sheetName}</span>
+              )}
+              {!ircLibrary && (
+                <p className="muted small">
+                  No <code>public/irc-codes/INDEX.json</code> found. Drop your IRC v63/v64 <code>.md</code> files
+                  into <code>public/irc-codes/</code> and list them in <code>INDEX.json</code> to enable cross-referencing.
+                </p>
+              )}
+            </details>
+          )}
+
+          {kept.length > 0 && (
+            <div className="panel">
+              <p className="panel-title">Per-sheet summary</p>
+              <table className="tbl">
+                <thead>
+                  <tr>
+                    <th>Sheet</th>
+                    <th>Orig rows</th>
+                    <th>Kept rows</th>
+                    <th>Orig cols</th>
+                    <th>Kept cols</th>
+                    <th>Empty cols removed</th>
+                    <th>Blank runs collapsed</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {kept.map((s, i) => (
+                    <tr
+                      key={s.name}
+                      className={i === activeSheet ? "active" : ""}
+                      onClick={() => setActiveSheet(i)}
+                      style={{ cursor: "pointer" }}
+                    >
+                      <td><code>{s.name}</code></td>
+                      <td>{s.originalRowCount.toLocaleString()}</td>
+                      <td>{s.cleanedRowCount.toLocaleString()}</td>
+                      <td>{s.originalColCount}</td>
+                      <td>{s.cleanedColCount}</td>
+                      <td>{s.removedColumnIndexes.length}</td>
+                      <td>{s.collapsedBlankRowRuns}</td>
+                    </tr>
                   ))}
-                </div>
-              </div>
-            )}
-
-            {/* Instructions */}
-            <div style={{
-              background: "var(--color-background-info)",
-              border: "0.5px solid var(--color-border-info)",
-              borderRadius: "var(--border-radius-md)", padding: "1rem 1.25rem", marginBottom: "1.5rem"
-            }}>
-              <p style={{ margin: "0 0 6px", fontWeight: 500, fontSize: 14, color: "var(--color-text-info)" }}>
-                <i className="ti ti-info-circle" style={{ marginRight: 6 }} aria-hidden="true" />
-                Next step
-              </p>
-              <p style={{ margin: 0, fontSize: 13, color: "var(--color-text-info)", lineHeight: 1.6 }}>
-                Download the cleaned .xlsx above, then upload it into Ver63 (DPR Analyzer Pro). All sheet names and cell positions are preserved, so clause citations will reference the correct location.
-              </p>
+                </tbody>
+              </table>
             </div>
+          )}
 
-            {/* Text preview */}
-            {showPreview && (
-              <div>
-                <p style={{ margin: "0 0 8px", fontWeight: 500, fontSize: 14 }}>Text preview (first ~120K chars)</p>
-                <pre style={{
-                  background: "var(--color-background-secondary)",
-                  border: "0.5px solid var(--color-border-tertiary)",
-                  borderRadius: "var(--border-radius-md)",
-                  padding: "0.75rem 1rem",
-                  fontSize: 11, fontFamily: "monospace",
-                  overflowX: "auto", whiteSpace: "pre-wrap",
-                  maxHeight: 400, overflowY: "auto",
-                  lineHeight: 1.5
-                }}>{textPreview.slice(0, 12000)}{textPreview.length > 12000 ? "\n\n[... preview truncated — download full text file for complete content ...]" : ""}</pre>
+          {skipped.length > 0 && (
+            <div className="panel">
+              <p className="panel-title">Empty sheets ({skipped.length})</p>
+              <div className="chips">
+                {skipped.map((s) => (
+                  <span key={s.name} className="chip">{s.name}</span>
+                ))}
               </div>
-            )}
+            </div>
+          )}
+
+          {kept[activeSheet] && (
+            <SheetPreview sheet={kept[activeSheet]} />
+          )}
+
+          <div className="hint">
+            <strong>Next step:</strong> upload the cleaned <code>.xlsx</code> (or paste the Markdown export)
+            into your DPR Analyzer (Ver63 / Ver64). Cell positions, sheet names, units and quantities are preserved,
+            so IRC clause citations resolve correctly.
           </div>
-        )}
+        </section>
+      )}
+
+      <footer className="foot muted small">
+        100% client-side · your workbook never leaves your browser · deploy to Netlify by pushing this repo and connecting it.
+      </footer>
+    </div>
+  );
+}
+
+function Stat({ label, value, accent }) {
+  return (
+    <div className={`stat stat-${accent || ""}`}>
+      <div className="stat-label">{label}</div>
+      <div className="stat-value">{value}</div>
+    </div>
+  );
+}
+
+function CleaningOptions({ options, onChange }) {
+  return (
+    <details className="panel">
+      <summary>Cleaning options</summary>
+      <div className="opt-grid">
+        <label>
+          <input
+            type="checkbox"
+            checked={options.collapseBlankRows}
+            onChange={(e) => onChange({ ...options, collapseBlankRows: e.target.checked })}
+          />
+          <span>Collapse runs of blank rows down to 1 (preserves separators)</span>
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={options.dropEmptyMidColumns}
+            onChange={(e) => onChange({ ...options, dropEmptyMidColumns: e.target.checked })}
+          />
+          <span>Remove fully-empty columns (including phantom ones)</span>
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={options.dropEmptyMidRows}
+            onChange={(e) => onChange({ ...options, dropEmptyMidRows: e.target.checked })}
+          />
+          <span>Remove <em>all</em> blank rows (more aggressive — may merge BOQ sections)</span>
+        </label>
       </div>
-    </>
+      <p className="muted small">
+        Data inside non-empty cells is never modified beyond whitespace normalization
+        (trim, collapse runs of spaces, normalize line endings). Numbers and dates are preserved.
+      </p>
+    </details>
+  );
+}
+
+function SheetPreview({ sheet }) {
+  const MAX_ROWS = 200;
+  const MAX_COLS = 30;
+  const rows = sheet.rows.slice(0, MAX_ROWS);
+  const truncRows = sheet.rows.length > MAX_ROWS;
+  const cols = sheet.cleanedColCount;
+  const truncCols = cols > MAX_COLS;
+  const showCols = Math.min(cols, MAX_COLS);
+
+  return (
+    <div className="panel">
+      <p className="panel-title">
+        Preview: <code>{sheet.name}</code>{" "}
+        <span className="muted small">
+          showing {rows.length}/{sheet.cleanedRowCount} rows × {showCols}/{cols} cols
+          {(truncRows || truncCols) && " (preview only — full data is in the export)"}
+        </span>
+      </p>
+      <div className="preview-scroll">
+        <table className="preview-tbl">
+          <tbody>
+            {rows.map((row, ri) => (
+              <tr key={ri} className={ri === sheet.headerRowIndex ? "header-row" : ""}>
+                <td className="rownum">{ri + 1}</td>
+                {row.slice(0, showCols).map((cell, ci) => (
+                  <td key={ci}>{cell === null ? "" : String(cell)}</td>
+                ))}
+                {truncCols && <td className="muted">…</td>}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
