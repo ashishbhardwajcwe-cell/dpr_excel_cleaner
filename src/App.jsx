@@ -12,7 +12,7 @@ function readExcelForCleaning(file) {
     r.onload = (e) => {
       try {
         const data = new Uint8Array(e.target.result);
-        const wb = window.XLSX.read(data, { type: "array" });
+        const wb = XLSX.read(data, { type: "array" });
         resolve(wb);
       } catch (err) {
         reject(err);
@@ -78,7 +78,7 @@ function cleanSheet(ws, sheetName) {
 }
 
 function buildCleanWorkbook(results) {
-  const wb = window.XLSX.utils.book_new();
+  const wb = XLSX.utils.book_new();
   for (const r of results) {
     if (r.skipped) continue;
     const ws = window.XLSX.utils.aoa_to_sheet(r.rows);
